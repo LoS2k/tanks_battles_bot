@@ -19,8 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN    = os.getenv("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+TOKEN    = os.getenv("DISCORD_TOKEN", "MTQ5NTc1NTA1MjQwMzUyMzcxNQ.GhMy2k.xGizqMy-V9_AbkTBoPEwBJekmbe0SiQNpYLerk")
+GUILD_ID = int(os.getenv("GUILD_ID", "1495670166892314636"))
 
 # ─── МОВИ ──────────────────────────────────────────────────────────────────────
 LANGS = {
