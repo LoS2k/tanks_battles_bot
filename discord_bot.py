@@ -1,827 +1,577 @@
 """
-🎮 8-BIT TANKS — Discord Bot v3 (Виправлена версія)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Ролі: повна ієрархія (EN назви)
-✅ Авто-видача ролі Player + флаг країни після реєстрації
-✅ Голосові кімнати: створення, налаштування, закриття, +15хв після виходу
-✅ Автопереклад у мовних каналах
-✅ Реєстрація гравців
+🎮 8-BIT TANKS — Discord Moderation Bot v1.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Повна ієрархія покарань: warn → mute → kick → tempban → permban
+✅ Авто-escalation за кількістю warn (1→mute1h, 3→mute24h, 5→tempban3d, 6→ban)
+✅ Temp-ban з авто-unban (кожні 60с)
+✅ Anti-spam: 5 повідомлень/5с → mute 5хв
+✅ Forbidden words авто-warn + видалення
+✅ Report система з кнопками та модалами
+✅ Quick punish модали для модераторів
+✅ Повний лог у #mod-log
+✅ JSON БД: warns/reports/tempbans
 """
 
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import json, os, asyncio, aiohttp
-from datetime import datetime, timezone
-from dotenv import load_dotenv
+import json, os, asyncio
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+import re
 
-load_dotenv()
+# ─── НАЛАШТУВАННЯ ──────────────────────────────────────────────────────────────
+MODLOG_NAME = "mod-log"
+WARN_FILE = "warns.json"
+REPORT_FILE = "reports.json"
+TEMPBAN_FILE = "tempbans.json"
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "1495670166892314636"))
-
-if not TOKEN:
-    raise ValueError("❌ DISCORD_TOKEN not found in .env file!")
-
-# ─── МОВИ ──────────────────────────────────────────────────────────────────────
-LANGS = {
-    "uk": {"flag": "🇺🇦", "name": "Українська", "code": "uk-UA", "role": "🇺🇦 Ukrainian"},
-    "en": {"flag": "🇬🇧", "name": "English",    "code": "en-GB", "role": "🇬🇧 English"},
-    "de": {"flag": "🇩🇪", "name": "Deutsch",    "code": "de-DE", "role": "🇩🇪 Deutsch"},
-    "pl": {"flag": "🇵🇱", "name": "Polski",     "code": "pl-PL", "role": "🇵🇱 Polski"},
-    "fr": {"flag": "🇫🇷", "name": "Français",   "code": "fr-FR", "role": "🇫🇷 Français"},
+# ESCALATION: {warn_count: (action, duration_seconds)}
+ESCALATION = {
+    1: ("mute", 3600),      # 1h
+    3: ("mute", 86400),     # 24h  
+    4: ("kick", 0),
+    5: ("tempban", 259200), # 3d
+    6: ("ban", 0)           # permanent
 }
 
-# Канали де активний автопереклад
-TRANSLATE_CHANNELS = [
-    "загальний","general","allgemein","ogólny","général",
-    "ігровий-чат","game-chat","spiel-chat","czat-gry","chat-jeu",
-]
+SPAM_LIMIT = 5
+SPAM_WINDOW = 5  # seconds
+BANNED_WORDS = ["cheat", "hack", "aimbot", "wallhack", "exploit", "cheater"]
 
-TRANSLATE_API = "https://api.mymemory.translated.net/get"
+# ─── БАЗА ДАНИХ ───────────────────────────────────────────────────────────────
+def load_file(filename):
+    if os.path.exists(filename):
+        with open(filename, 'r') as f:
+            return json.load(f)
+    return {}
 
-# ─── БД ────────────────────────────────────────────────────────────────────────
-DB_FILE = "players.json"
-ROOMS_FILE = "rooms.json"
+def save_file(filename, data):
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-def load_db() -> dict:
-    if not os.path.exists(DB_FILE): return {}
-    with open(DB_FILE) as f: return json.load(f)
+def get_warns(uid: str) -> list:
+    return load_file(WARN_FILE).get(str(uid), [])
 
-def save_db(d: dict):
-    with open(DB_FILE, "w") as f: json.dump(d, f, indent=2, ensure_ascii=False)
+def add_warn(uid: str, reason: str, mod_id: int) -> int:
+    db = load_file(WARN_FILE)
+    uid = str(uid)
+    if uid not in db:
+        db[uid] = []
+    db[uid].append({
+        "reason": reason,
+        "mod_id": mod_id,
+        "time": datetime.now().isoformat()
+    })
+    save_file(WARN_FILE, db)
+    return len(db[uid])
 
-def get_player(uid) -> dict | None:
-    return load_db().get(str(uid))
+def clear_warns(uid: str):
+    db = load_file(WARN_FILE)
+    db.pop(str(uid), None)
+    save_file(WARN_FILE, db)
 
-def set_player(uid, data: dict):
-    db = load_db(); db[str(uid)] = data; save_db(db)
+def add_report(target_id: int, reporter_id: int, reason: str, proof: str = "") -> str:
+    db = load_file(REPORT_FILE)
+    rid = f"R{len(db):04d}"
+    db[rid] = {
+        "target_id": str(target_id),
+        "reporter_id": str(reporter_id),
+        "reason": reason,
+        "proof": proof,
+        "status": "open",
+        "time": datetime.now().isoformat()
+    }
+    save_file(REPORT_FILE, db)
+    return rid
 
-def load_rooms() -> dict:
-    if not os.path.exists(ROOMS_FILE): return {}
-    with open(ROOMS_FILE) as f: return json.load(f)
+def close_report(rid: str):
+    db = load_file(REPORT_FILE)
+    if rid in db:
+        db[rid]["status"] = "closed"
+        save_file(REPORT_FILE, db)
 
-def save_rooms(d: dict):
-    with open(ROOMS_FILE, "w") as f: json.dump(d, f, indent=2, ensure_ascii=False)
+def add_tempban(guild_id: int, uid: str, unban_at: float, reason: str):
+    db = load_file(TEMPBAN_FILE)
+    key = f"{guild_id}:{uid}"
+    db[key] = {
+        "uid": uid,
+        "guild_id": guild_id,
+        "unban_at": unban_at,
+        "reason": reason
+    }
+    save_file(TEMPBAN_FILE, db)
 
-def get_lang(user) -> str:
-    p = get_player(str(user.id))
-    return p.get("lang", "en") if p else "en"
+def remove_tempban(guild_id: int, uid: str):
+    db = load_file(TEMPBAN_FILE)
+    key = f"{guild_id}:{uid}"
+    db.pop(key, None)
+    save_file(TEMPBAN_FILE, db)
 
-# ─── ПЕРЕКЛАД ──────────────────────────────────────────────────────────────────
-async def translate_text(text: str, target: str, source: str = "en") -> str | None:
-    if len(text) > 400: text = text[:400] + "…"
-    src = LANGS.get(source, {}).get("code", "en-GB")
-    tgt = LANGS.get(target, {}).get("code", "en-GB")
-    if src == tgt: return None
+def get_active_tempbans():
+    return list(load_file(TEMPBAN_FILE).values())
+
+# ─── УТИЛІТИ ──────────────────────────────────────────────────────────────────
+def fmt_duration(seconds: int) -> str:
+    if seconds == 0:
+        return "permanent"
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    return " ".join(parts) or "1m"
+
+def parse_duration(text: str) -> int:
+    multipliers = {'s':1, 'm':60, 'h':3600, 'd':86400, 'w':604800}
+    total = 0
+    buf = ''
+    text = text.strip().lower()
+    for ch in text + 's':  # default seconds
+        if ch.isdigit():
+            buf += ch
+        elif ch in multipliers and buf:
+            total += int(buf) * multipliers[ch]
+            buf = ''
+    return total if total > 0 else -1
+
+# ─── АВТО-ESCLATION ───────────────────────────────────────────────────────────
+async def apply_escalation(member: discord.Member, warn_count: int, reason: str, guild: discord.Guild):
+    action, duration = ESCALATION.get(min(warn_count, max(ESCALATION.keys())), ("ban", 0))
+    
+    msgs = {
+        "warn": f"⚠️ Warning #{warn_count} on **{guild.name}**\n**Reason:** {reason}",
+        "mute": f"🔇 **Muted** on **{guild.name}** for `{fmt_duration(duration)}`\n**Reason:** {reason} (warn #{warn_count})",
+        "kick": f"👢 **Kicked** from **{guild.name}**\n**Reason:** {reason} (warn #{warn_count})",
+        "tempban": f"⏳ **Temp-banned** from **{guild.name}** for `{fmt_duration(duration)}`\n**Reason:** {reason} (warn #{warn_count})",
+        "ban": f"🔨 **Permanently banned** from **{guild.name}**\n**Reason:** {reason} (warn #{warn_count})"
+    }
+    
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(TRANSLATE_API,
-                             params={"q": text, "langpair": f"{src}|{tgt}"},
-                             timeout=aiohttp.ClientTimeout(total=5)) as r:
-                if r.status == 200:
-                    d = await r.json()
-                    if d.get("responseStatus") == 200:
-                        t = d["responseData"]["translatedText"]
-                        if t and t.lower() != text.lower():
-                            return t
+        await member.send(msgs.get(action, msgs["warn"]))
     except Exception:
         pass
-    return None
+    
+    if action == "mute" and duration > 0:
+        until = discord.utils.utcnow() + timedelta(seconds=duration)
+        try:
+            await member.timeout(until=until, reason=f"Auto-escalation (warn #{warn_count})")
+        except Exception:
+            pass
+    elif action == "kick":
+        try:
+            await member.kick(reason=f"Auto-escalation (warn #{warn_count})")
+        except Exception:
+            pass
+    elif action == "tempban":
+        unban_at = datetime.now(timezone.utc).timestamp() + duration
+        add_tempban(guild.id, str(member.id), unban_at, reason)
+        try:
+            await guild.ban(member, reason=f"Temp-ban `{fmt_duration(duration)}` (warn #{warn_count})", delete_message_days=0)
+        except Exception:
+            pass
+    elif action == "ban":
+        try:
+            await guild.ban(member, reason=f"Permanent ban (warn #{warn_count})", delete_message_days=1)
+        except Exception:
+            pass
 
-# ─── БОТ ───────────────────────────────────────────────────────────────────────
+# ─── REPORT VIEW ──────────────────────────────────────────────────────────────
+class ModActionView(discord.ui.View):
+    def __init__(self, target_id: int, report_id: str):
+        super().__init__(timeout=None)
+        self.target_id = target_id
+        self.report_id = report_id
+
+    def is_mod(self, i: discord.Interaction) -> bool:
+        return any(r.permissions.moderate_members or r.permissions.administrator 
+                  for r in i.user.roles)
+
+    @discord.ui.button(label="⚠️ Warn", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_warn(self, i: discord.Interaction, _):
+        if not self.is_mod(i):
+            return await i.response.send_message("❌ No permission!", ephemeral=True)
+        await i.response.send_modal(QuickPunishModal("warn", self.target_id, self.report_id))
+
+    @discord.ui.button(label="🔇 Mute 1h", style=discord.ButtonStyle.primary, row=0)
+    async def btn_mute1(self, i: discord.Interaction, _):
+        if not self.is_mod(i):
+            return await i.response.send_message("❌ No permission!", ephemeral=True)
+        await self.do_mute(i, 3600)
+
+    @discord.ui.button(label="🔇 Mute 24h", style=discord.ButtonStyle.primary, row=0)
+    async def btn_mute24(self, i: discord.Interaction, _):
+        if not self.is_mod(i):
+            return await i.response.send_message("❌ No permission!", ephemeral=True)
+        await self.do_mute(i, 86400)
+
+    @discord.ui.button(label="⏳ Temp-ban", style=discord.ButtonStyle.danger, row=1)
+    async def btn_tempban(self, i: discord.Interaction, _):
+        if not self.is_mod(i):
+            return await i.response.send_message("❌ No permission!", ephemeral=True)
+        await i.response.send_modal(QuickPunishModal("tempban", self.target_id, self.report_id))
+
+    @discord.ui.button(label="🔨 Perm-ban", style=discord.ButtonStyle.danger, row=1)
+    async def btn_ban(self, i: discord.Interaction, _):
+        if not self.is_mod(i):
+            return await i.response.send_message("❌ No permission!", ephemeral=True)
+        await i.response.send_modal(QuickPunishModal("ban", self.target_id, self.report_id))
+
+    @discord.ui.button(label="✅ Dismiss", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_dismiss(self, i: discord.Interaction, _):
+        if not self.is_mod(i):
+            return await i.response.send_message("❌ No permission!", ephemeral=True)
+        close_report(self.report_id)
+        await i.response.send_message(f"✅ Report `{self.report_id}` dismissed by {i.user.mention}")
+        self.disable()
+        await i.message.edit(view=self)
+
+    def disable(self):
+        for item in self.children:
+            item.disabled = True
+
+    async def do_mute(self, i: discord.Interaction, secs: int):
+        member = i.guild.get_member(self.target_id)
+        if not member:
+            return await i.response.send_message("❌ Member not found!", ephemeral=True)
+        until = discord.utils.utcnow() + timedelta(seconds=secs)
+        await member.timeout(until=until, reason=f"Muted by {i.user.display_name}")
+        try:
+            await member.send(f"🔇 **Muted** on **{i.guild.name}** for `{fmt_duration(secs)}`.")
+        except:
+            pass
+        await i.response.send_message(f"{member.display_name} muted `{fmt_duration(secs)}`.")
+        close_report(self.report_id)
+        self.disable()
+        await i.message.edit(view=self)
+
+class QuickPunishModal(discord.ui.Modal):
+    reason_inp = discord.ui.TextInput(
+        label="Reason", 
+        max_length=200, 
+        placeholder="Describe the violation..."
+    )
+    duration_inp = discord.ui.TextInput(
+        label="Duration (tempban only): 1d, 12h, 30m", 
+        placeholder="3d", 
+        required=False, 
+        max_length=10
+    )
+
+    def __init__(self, action: str, target_id: int, report_id: str):
+        titles = {"warn": "⚠️ Warn Player", "tempban": "⏳ Temp-ban Player", "ban": "🔨 Ban Player"}
+        super().__init__(title=titles.get(action, "Punish"))
+        self.action = action
+        self.target_id = target_id
+        self.report_id = report_id
+
+    async def on_submit(self, i: discord.Interaction):
+        reason = self.reason_inp.value
+        member = i.guild.get_member(self.target_id)
+        if not member:
+            return await i.response.send_message("❌ Member not found (may have left).", ephemeral=True)
+
+        if self.action == "warn":
+            count = add_warn(str(self.target_id), reason, i.user.id)
+            await apply_escalation(member, count, reason, i.guild)
+            await i.response.send_message(f"{member.display_name} warned ({count} total).")
+        
+        elif self.action == "tempban":
+            raw = (self.duration_inp.value.strip() or "3d")
+            secs = parse_duration(raw)
+            if secs == -1:
+                secs = 259200  # 3d default
+            unban_at = datetime.now(timezone.utc).timestamp() + secs
+            add_tempban(i.guild.id, str(member.id), unban_at, reason)
+            try:
+                await member.send(f"⏳ **Temp-banned** from **{i.guild.name}** for `{fmt_duration(secs)}`.\n**Reason:** {reason}\n**Auto-unban:** <t:{int(unban_at)}:F>")
+            except:
+                pass
+            await i.guild.ban(member, reason=f"Temp-ban `{fmt_duration(secs)}`: {reason}", delete_message_days=0)
+            await i.response.send_message(f"{member.display_name} temp-banned for `{fmt_duration(secs)}`.\n**Auto-unban:** <t:{int(unban_at)}:F>")
+        
+        elif self.action == "ban":
+            try:
+                await member.send(f"🔨 **Permanently banned** from **{i.guild.name}**.\n**Reason:** {reason}")
+            except:
+                pass
+            await i.guild.ban(member, reason=reason, delete_message_days=1)
+            await i.response.send_message(f"{member.display_name} permanently banned.")
+
+        close_report(self.report_id)
+        # Disable view buttons
+        for item in self.view.children:
+            item.disabled = True  # type: ignore
+        await i.message.edit(view=self.view)  # type: ignore
+
+# ─── КОМАНДИ ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ─── ЗАДАЧА: ПРИБИРАННЯ КІМНАТ ─────────────────────────────────────────────────
-@tasks.loop(seconds=30)
-async def room_cleanup_task():
-    """Кожні 30с перевіряє чи минуло 15хв після того як кімната спорожніла."""
-    rooms = load_rooms()
+# REPORT GROUP
+report_grp = app_commands.Group(name="report", description="Report a player")
+
+@report_grp.command(name="player", description="Report a player")
+@app_commands.describe(player="Player to report", reason="Reason for report")
+async def report_player(i: discord.Interaction, player: discord.Member, reason: str):
+    if player.bot:
+        return await i.response.send_message("❌ Can't report bots!", ephemeral=True)
+    
+    ml = discord.utils.get(i.guild.text_channels, name=MODLOG_NAME)
+    if not ml:
+        return await i.response.send_message("❌ Mod-log channel not found!", ephemeral=True)
+    
+    rid = add_report(player.id, i.user.id, reason)
+    warns = get_warns(str(player.id))
+    
+    embed = discord.Embed(title=f"📋 Report `{rid}`", color=0xFF4444, timestamp=datetime.now(timezone.utc))
+    embed.set_thumbnail(url=player.display_avatar.url)
+    embed.add_field(name="Reported", value=player.mention, inline=True)
+    embed.add_field(name="Reporter", value=i.user.mention, inline=True)
+    embed.add_field(name="Warns", value=f"{len(warns)}/{max(ESCALATION.keys())}", inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.set_footer(text="Use buttons below to take action")
+    
+    await ml.send(content="🔔 **New report!** 🔔", embed=embed, view=ModActionView(player.id, rid))
+    await i.response.send_message(f"✅ Report `{rid}` submitted. Moderators notified! 🔔", ephemeral=True)
+
+tree.add_command(report_grp)
+
+# MOD COMMANDS
+@tree.command(name="warn", description="⚠️ MOD: Warn a player")
+@app_commands.describe(player="Player", reason="Reason")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_warn(i: discord.Interaction, player: discord.Member, reason: str):
+    count = add_warn(str(player.id), reason, i.user.id)
+    action = ESCALATION.get(min(count, max(ESCALATION.keys())), ("ban", 0))[0]
+    action_labels = {"warn": "Warned", "mute": "Muted", "kick": "Kicked", "tempban": "Temp-banned", "ban": "Banned"}
+    
+    embed = discord.Embed(title="🔨 Moderation Action", color=0xFF6B35, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Player", value=player.mention, inline=True)
+    embed.add_field(name="Warns", value=f"{count}/{max(ESCALATION.keys())}", inline=True)
+    embed.add_field(name="Action", value=action_labels.get(action, "Warned"), inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Mod", value=i.user.mention, inline=True)
+    
+    await i.response.send_message(embed=embed)
+    
+    ml = discord.utils.get(i.guild.text_channels, name=MODLOG_NAME)
+    if ml:
+        await ml.send(embed=embed)
+    
+    await apply_escalation(player, count, reason, i.guild)
+
+@tree.command(name="mute", description="🔇 MOD: Mute a player")
+@app_commands.describe(player="Player", duration="Duration (1h, 30m, 2d)", reason="Reason")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_mute(i: discord.Interaction, player: discord.Member, duration: str = "1h", reason: str = "No reason"):
+    secs = parse_duration(duration)
+    if secs == -1:
+        return await i.response.send_message("❌ Invalid duration. Use: `30m`, `2h`, `1d`", ephemeral=True)
+    
+    until = discord.utils.utcnow() + timedelta(seconds=secs)
+    await player.timeout(until=until, reason=reason)
+    try:
+        await player.send(f"🔇 **Muted** on **{i.guild.name}** for `{fmt_duration(secs)}`.\n**Reason:** {reason}")
+    except:
+        pass
+    
+    await i.response.send_message(f"{player.display_name} muted for `{fmt_duration(secs)}`.\n**Unmutes:** <t:{int(until.timestamp())}:R>")
+
+@tree.command(name="unmute", description="🔊 MOD: Remove mute")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_unmute(i: discord.Interaction, player: discord.Member):
+    await player.timeout(None)
+    await i.response.send_message(f"{player.display_name} unmuted.")
+
+@tree.command(name="kick", description="👢 MOD: Kick a player")
+@app_commands.describe(player="Player", reason="Reason")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_kick(i: discord.Interaction, player: discord.Member, reason: str = "No reason"):
+    try:
+        await player.send(f"👢 **Kicked** from **{i.guild.name}**.\n**Reason:** {reason}")
+    except:
+        pass
+    await player.kick(reason=reason)
+    await i.response.send_message(f"{player.display_name} kicked.")
+
+@tree.command(name="tempban", description="⏳ MOD: Temp-ban with auto-unban timer")
+@app_commands.describe(player="Player", duration="Duration", reason="Reason")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_tempban(i: discord.Interaction, player: discord.Member, duration: str, reason: str = "No reason"):
+    secs = parse_duration(duration)
+    if secs == -1:
+        return await i.response.send_message("❌ Invalid duration. Use: `1d`, `12h`, `30m`", ephemeral=True)
+    
+    unban_at = datetime.now(timezone.utc).timestamp() + secs
+    add_tempban(i.guild.id, str(player.id), unban_at, reason)
+    
+    try:
+        await player.send(f"⏳ **Temp-banned** from **{i.guild.name}** for `{fmt_duration(secs)}`.\n**Reason:** {reason}\n**Auto-unban:** <t:{int(unban_at)}:F>")
+    except:
+        pass
+    
+    await i.guild.ban(player, reason=f"Temp-ban `{fmt_duration(secs)}`: {reason}", delete_message_days=0)
+    
+    embed = discord.Embed(title="⏳ Temp-ban Applied", color=0xFF6B35, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Player", value=player.mention, inline=True)
+    embed.add_field(name="Duration", value=fmt_duration(secs), inline=True)
+    embed.add_field(name="Unban at", value=f"<t:{int(unban_at)}:F>", inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Mod", value=i.user.mention, inline=True)
+    
+    await i.response.send_message(embed=embed)
+    
+    ml = discord.utils.get(i.guild.text_channels, name=MODLOG_NAME)
+    if ml:
+        await ml.send(embed=embed)
+
+@tree.command(name="ban", description="🔨 MOD: Permanently ban a player")
+@app_commands.describe(player="Player", reason="Reason")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_ban(i: discord.Interaction, player: discord.Member, reason: str = "No reason"):
+    try:
+        await player.send(f"🔨 **Permanently banned** from **{i.guild.name}**.\n**Reason:** {reason}")
+    except:
+        pass
+    await i.guild.ban(player, reason=reason, delete_message_days=1)
+    await i.response.send_message(f"{player.display_name} permanently banned.")
+
+@tree.command(name="unban", description="🔓 MOD: Unban a user by ID")
+@app_commands.describe(userid="User ID (number)")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_unban(i: discord.Interaction, userid: str):
+    try:
+        user = await bot.fetch_user(int(userid))
+        await i.guild.unban(user, reason=f"Unbanned by {i.user.display_name}")
+        remove_tempban(i.guild.id, userid)
+        await i.response.send_message(f"{user.name} unbanned.")
+    except Exception as e:
+        await i.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+@tree.command(name="warns", description="📋 MOD: View player warns")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_warns(i: discord.Interaction, player: discord.Member):
+    warns = get_warns(str(player.id))
+    embed = discord.Embed(title=f"📋 Warns: {player.display_name}", color=0xFF6B35 if warns else 0x57F287)
+    
+    if not warns:
+        embed.description = "✅ No warnings on record."
+    else:
+        for idx, w in enumerate(warns, 1):
+            next_action = ESCALATION.get(idx, ("ban", 0))[0].upper()
+            embed.add_field(
+                name=f"#{idx} {w['time'][:10]}",
+                value=f"**Reason:** {w['reason']}\n**Mod:** <@{w['mod_id']}>",
+                inline=False
+            )
+        embed.set_footer(text=f"Next escalation: {ESCALATION.get(len(warns), ('ban', 0))[0].upper()}")
+    
+    await i.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="clearwarns", description="🗑️ MOD: Clear all warns")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_clearwarns(i: discord.Interaction, player: discord.Member):
+    clear_warns(str(player.id))
+    await i.response.send_message(f"🗑️ All warns cleared for {player.display_name}.")
+
+@tree.command(name="tempbans", description="⏳ MOD: List active temp-bans")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def cmd_tempbans(i: discord.Interaction):
+    bans = [b for b in get_active_tempbans() if b["guild_id"] == i.guild.id]
+    embed = discord.Embed(title="⏳ Active Temp-bans", color=0xFF6B35)
+    
+    if not bans:
+        embed.description = "✅ No active temp-bans."
+    else:
+        for b in bans:
+            ts = int(b["unban_at"])
+            embed.add_field(
+                name=f"<@{b['uid']}>",
+                value=f"**Unban:** <t:{ts}:F> (<t:{ts}:R>)\n**Reason:** {b['reason']}",
+                inline=False
+            )
+    
+    await i.response.send_message(embed=embed, ephemeral=True)
+
+# ─── AUTO-MOD ─────────────────────────────────────────────────────────────────
+spam_tracker = defaultdict(list)
+
+@bot.listen()
+async def automod(message: discord.Message):
+    if message.author.bot:
+        return
+    if any(r.permissions.moderate_members for r in message.author.roles):
+        return
+    
+    uid = message.author.id
     now = datetime.now(timezone.utc).timestamp()
-    to_delete = []
+    
+    # Anti-spam
+    spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < SPAM_WINDOW]
+    spam_tracker[uid].append(now)
+    if len(spam_tracker[uid]) >= SPAM_LIMIT:
+        spam_tracker[uid].clear()
+        try:
+            await message.author.timeout(discord.utils.utcnow() + timedelta(minutes=5), reason="Auto-mod: spam")
+        except:
+            pass
+        await message.channel.send(f"{message.author.mention} auto-muted 5 min for spam.", delete_after=8)
+        return
+    
+    # Forbidden words
+    if any(w in message.content.lower() for w in BANNED_WORDS):
+        try:
+            await message.delete()
+        except:
+            pass
+        count = add_warn(str(uid), "Auto-mod: forbidden word", 0)
+        await apply_escalation(message.author, count, "Forbidden word", message.guild)
+        await message.channel.send(f"{message.author.mention} message removed. Forbidden content. ⚠️({count}/{max(ESCALATION.keys())})", delete_after=8)
 
-    for ch_id, info in rooms.items():
-        empty_since = info.get("empty_since")
-        if empty_since and (now - empty_since) >= 900:  # 15 хвилин
-            to_delete.append(ch_id)
-
-    for ch_id in to_delete:
-        guild = bot.get_guild(GUILD_ID)
-        if guild:
-            ch = guild.get_channel(int(ch_id))
-            if ch:
+# ─── AUTO-UNBAN TASK ──────────────────────────────────────────────────────────
+@tasks.loop(seconds=60)
+async def unban_loop():
+    now = datetime.now(timezone.utc).timestamp()
+    bans = get_active_tempbans()
+    
+    for entry in bans:
+        if entry["unban_at"] <= now:
+            gid = entry["guild_id"]
+            uid = int(entry["uid"])
+            guild = bot.get_guild(gid)
+            if guild:
                 try:
-                    await ch.delete(reason="Room empty for 15 minutes")
-                    print(f"🗑️ Deleted empty room: {ch.name}")
-                except Exception:
-                    pass
-        rooms.pop(ch_id, None)
-
-    if to_delete:
-        save_rooms(rooms)
+                    user = await bot.fetch_user(uid)
+                    await guild.unban(user, reason="Temp-ban expired")
+                    remove_tempban(gid, str(uid))
+                    
+                    # Log
+                    ml = discord.utils.get(guild.text_channels, name=MODLOG_NAME)
+                    if ml:
+                        embed = discord.Embed(title="⏳ Temp-ban Expired", 
+                                            description=f"<@{uid}> has been automatically unbanned.", 
+                                            color=0x57F287, timestamp=datetime.now(timezone.utc))
+                        await ml.send(embed=embed)
+                    
+                    try:
+                        await user.send(f"✅ Your temp-ban on **{guild.name}** has expired. You can rejoin!")
+                    except:
+                        pass
+                    
+                    print(f"Auto-unbanned {uid} from {guild.name}")
+                except Exception as e:
+                    print(f"Unban error {uid}: {e}")
 
 @bot.event
 async def on_ready():
     await tree.sync()
-    room_cleanup_task.start()
-    print(f"✅ 8-BIT TANKS Bot v3 online: {bot.user}")
-    await bot.change_presence(activity=discord.Game("🎮 8-BIT TANKS | /register"))
-
-# ─── ГОЛОСОВІ ПОДІЇ: відстеження порожніх кімнат ────────────────────────────────
-@bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    rooms = load_rooms()
-
-    # Якщо вийшов з кімнати
-    if before.channel and str(before.channel.id) in rooms:
-        ch = before.channel
-        if len(ch.members) == 0:
-            rooms[str(ch.id)]["empty_since"] = datetime.now(timezone.utc).timestamp()
-            save_rooms(rooms)
-            # Повідомлення в текстовий канал кімнати якщо є
-            txt_id = rooms[str(ch.id)].get("text_channel_id")
-            if txt_id:
-                txt = member.guild.get_channel(int(txt_id))
-                if txt:
-                    await txt.send("⏳ Room is empty. It will be **deleted in 15 minutes** unless someone joins.")
-
-    # Якщо хтось зайшов — скасувати таймер видалення
-    if after.channel and str(after.channel.id) in rooms:
-        if rooms[str(after.channel.id)].get("empty_since"):
-            rooms[str(after.channel.id)]["empty_since"] = None
-            save_rooms(rooms)
-
-# ─── ВИБІР МОВИ ────────────────────────────────────────────────────────────────
-class LangView(discord.ui.View):
-    def __init__(self, user: discord.User | discord.Member):
-        super().__init__(timeout=300)
-        self.member = user
-
-    async def _set(self, interaction: discord.Interaction, lang: str):
-        uid = str(self.member.id)
-        info = LANGS[lang]
-
-        # Зберегти гравця
-        player = get_player(uid) or {
-            "wins": 0, "losses": 0, "kills": 0, "deaths": 0,
-            "registered": datetime.now().isoformat()
-        }
-        player.update({"name": self.member.display_name or self.member.name, "lang": lang})
-        set_player(uid, player)
-
-        guild = interaction.guild
-
-        # ── Зняти старі мовні ролі та флаги ──────────────────────────────────
-        lang_role_names = [v["role"] for v in LANGS.values()]
-        to_remove = [r for r in self.member.roles if r.name in lang_role_names]
-        if to_remove:
-            await self.member.remove_roles(*to_remove)
-
-        # ── Дати нові ролі ────────────────────────────────────────────────────
-        roles_to_add = []
-
-        # 1. Флаг мови
-        flag_role = discord.utils.get(guild.roles, name=info["role"])
-        if flag_role:
-            roles_to_add.append(flag_role)
-
-        # 2. Роль Player (базова для всіх)
-        player_role = discord.utils.get(guild.roles, name="🎯 Player")
-        if player_role:
-            roles_to_add.append(player_role)
-
-        # 3. Мовна категорія lang-XX
-        lang_cat_role = discord.utils.get(guild.roles, name=f"lang-{lang}")
-        if lang_cat_role:
-            roles_to_add.append(lang_cat_role)
-
-        if roles_to_add:
-            await self.member.add_roles(*roles_to_add, reason="Language selected")
-
-        embed = discord.Embed(
-            title="✅ Registered!",
-            description=(
-                f"**{info['flag']} {info['name']}** selected!\n\n"
-                f"🟨 Basic Tank • Level 1\n"
-                f"📌 Use `/stats` to see your profile\n"
-                f"🏠 Use `/room create` to make a private room"
-            ),
-            color=0x00FF41
-        )
-        embed.set_footer(text="8-BIT TANKS • Welcome to the battlefield!")
-        await interaction.response.edit_message(embed=embed, view=None)
-
-    @discord.ui.button(label="🇺🇦 Українська", style=discord.ButtonStyle.primary, row=0)
-    async def btn_uk(self, i, _): await self._set(i, "uk")
-    @discord.ui.button(label="🇬🇧 English", style=discord.ButtonStyle.primary, row=0)
-    async def btn_en(self, i, _): await self._set(i, "en")
-    @discord.ui.button(label="🇩🇪 Deutsch", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_de(self, i, _): await self._set(i, "de")
-    @discord.ui.button(label="🇵🇱 Polski", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_pl(self, i, _): await self._set(i, "pl")
-    @discord.ui.button(label="🇫🇷 Français", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_fr(self, i, _): await self._set(i, "fr")
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    ch = discord.utils.get(member.guild.text_channels, name="👋│welcome")
-    if not ch: return
-    embed = discord.Embed(
-        title="🎮 8-BIT TANKS",
-        description=f"**{member.mention}** — choose your language to register!\nОберіть мову для реєстрації!",
-        color=0xFFD700
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    await ch.send(embed=embed, view=LangView(member))
-
-# ─── КОМАНДА /register ─────────────────────────────────────────────────────────
-@tree.command(name="register", description="Register / Зареєструватись")
-async def cmd_register(interaction: discord.Interaction):
-    uid = str(interaction.user.id)
-    if get_player(uid):
-        await interaction.response.send_message("⚠️ Already registered! Use `/lang` to change language.", ephemeral=True)
-        return
-    embed = discord.Embed(title="🎮 8-BIT TANKS — Choose Language", color=0xFFD700)
-    await interaction.response.send_message(embed=embed, view=LangView(interaction.user), ephemeral=True)
-
-# ─── КОМАНДА /lang ─────────────────────────────────────────────────────────────
-@tree.command(name="lang", description="Change language / Змінити мову")
-async def cmd_lang(interaction: discord.Interaction):
-    embed = discord.Embed(title="🌐 Choose Language", color=0x5865F2)
-    await interaction.response.send_message(embed=embed, view=LangView(interaction.user), ephemeral=True)
-
-# ─── КОМАНДА /stats ────────────────────────────────────────────────────────────
-@tree.command(name="stats", description="Player statistics / Статистика")
-async def cmd_stats(interaction: discord.Interaction, player: discord.Member = None):
-    target = player or interaction.user
-    data = get_player(str(target.id))
-    if not data:
-        await interaction.response.send_message("❌ Player not registered!", ephemeral=True)
-        return
-    w = data.get("wins", 0); l = data.get("losses", 0)
-    k = data.get("kills", 0); d = data.get("deaths", 0)
-    kd = round(k / max(d, 1), 2)
-    wr = round(w / max(w+l, 1) * 100, 1)
-    lang = data.get("lang", "en")
-    flag = LANGS.get(lang, {}).get("flag", "🌐")
-
-    embed = discord.Embed(title=f"📊 {target.display_name}", color=0xFFD700)
-    embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="🏆 Wins", value=str(w), inline=True)
-    embed.add_field(name="💀 Losses", value=str(l), inline=True)
-    embed.add_field(name="📊 Win%", value=f"{wr}%", inline=True)
-    embed.add_field(name="🎯 Kills", value=str(k), inline=True)
-    embed.add_field(name="☠️ Deaths", value=str(d), inline=True)
-    embed.add_field(name="📈 K/D", value=str(kd), inline=True)
-    embed.add_field(name="🌐 Lang", value=f"{flag} {LANGS.get(lang,{}).get('name',lang)}", inline=True)
-    embed.set_footer(text=f"Registered: {data.get('registered','')[:10]}")
-    await interaction.response.send_message(embed=embed)
-
-# ─── КОМАНДА /top ──────────────────────────────────────────────────────────────
-@tree.command(name="top", description="Leaderboard / Таблиця лідерів")
-async def cmd_top(interaction: discord.Interaction):
-    db = load_db()
-    top = sorted(db.items(), key=lambda x: x[1].get("wins", 0), reverse=True)[:10]
-    embed = discord.Embed(title="🏆 8-BIT TANKS — TOP 10", color=0xFFD700)
-    medals = ["🥇","🥈","🥉"] + ["🎖️"]*7
-    for i, (uid, d) in enumerate(top):
-        kd = round(d.get("kills",0)/max(d.get("deaths",1),1), 2)
-        flag = LANGS.get(d.get("lang","en"), {}).get("flag", "🌐")
-        embed.add_field(
-            name=f"{medals[i]} #{i+1} {flag} {d.get('name','?')}",
-            value=f"🏆 {d.get('wins',0)} wins • K/D {kd}",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed)
-
-# ─── КОМАНДА /win /loss (ADMIN) ────────────────────────────────────────────────
-@tree.command(name="win", description="[ADMIN] Add win")
-@app_commands.checks.has_permissions(administrator=True)
-async def cmd_win(interaction: discord.Interaction, player: discord.Member, kills: int = 1):
-    d = get_player(str(player.id))
-    if not d:
-        await interaction.response.send_message("❌ Not registered!", ephemeral=True); return
-    d["wins"] = d.get("wins",0) + 1
-    d["kills"] = d.get("kills",0) + kills
-    set_player(str(player.id), d)
-    await interaction.response.send_message(f"✅ +1 Win, +{kills} Kills → **{player.display_name}** 🏆")
-
-@tree.command(name="loss", description="[ADMIN] Add loss")
-@app_commands.checks.has_permissions(administrator=True)
-async def cmd_loss(interaction: discord.Interaction, player: discord.Member, deaths: int = 1):
-    d = get_player(str(player.id))
-    if not d:
-        await interaction.response.send_message("❌ Not registered!", ephemeral=True); return
-    d["losses"] = d.get("losses",0) + 1
-    d["deaths"] = d.get("deaths",0) + deaths
-    set_player(str(player.id), d)
-    await interaction.response.send_message(f"📝 +1 Loss, +{deaths} Deaths → **{player.display_name}**")
-
-# ─── АВТОПЕРЕКЛАД ──────────────────────────────────────────────────────────────
-def ch_lang(name: str) -> str | None:
-    n = name.split("│")[-1].strip() if "│" in name else name
-    for lang, channels in {
-        "uk": ["загальний","ігровий-чат","результати","пропозиції"],
-        "en": ["general","game-chat","results","suggestions"],
-        "de": ["allgemein","spiel-chat","ergebnisse","vorschläge"],
-        "pl": ["ogólny","czat-gry","wyniki","sugestie"],
-        "fr": ["général","chat-jeu","résultats","suggestions"],
-    }.items():
-        if any(c in n for c in channels):
-            return lang
-    return None
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.content:
-        return
-
-    target_lang = ch_lang(message.channel.name)
-    if target_lang:
-        author_lang = get_lang(message.author)
-        if author_lang != target_lang:
-            translated = await translate_text(message.content, target_lang, author_lang)
-            if translated:
-                af = LANGS.get(author_lang, {}).get("flag", "🌐")
-                tf = LANGS[target_lang]["flag"]
-                embed = discord.Embed(description=f"**{translated}**", color=0x5865F2)
-                embed.set_author(
-                    name=f"{af} {message.author.display_name} → {tf} Auto-translate",
-                    icon_url=message.author.display_avatar.url
-                )
-                embed.set_footer(text="MyMemory • /translate for manual translation")
-                await message.channel.send(embed=embed)
-
-    await bot.process_commands(message)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# СИСТЕМА ПРИВАТНИХ КІМНАТ
-# ══════════════════════════════════════════════════════════════════════════════
-
-room_group = app_commands.Group(name="room", description="Private room management / Управління кімнатою")
-
-class RoomSettingsView(discord.ui.View):
-    """Панель управління кімнатою — пишеться у текстовий канал кімнати."""
-    def __init__(self, owner_id: int, voice_ch_id: int, text_ch_id: int):
-        super().__init__(timeout=None)  # постійна
-        self.owner_id = owner_id
-        self.voice_ch_id = voice_ch_id
-        self.text_ch_id = text_ch_id
-
-    def _is_owner(self, i: discord.Interaction) -> bool:
-        return i.user.id == self.owner_id
-
-    # ── Перейменувати ───────────────────────────────────────────────────────
-    @discord.ui.button(label="✏️ Rename", style=discord.ButtonStyle.secondary, row=0)
-    async def btn_rename(self, interaction: discord.Interaction, _):
-        if not self._is_owner(interaction):
-            await interaction.response.send_message("❌ Only room owner can do this!", ephemeral=True); return
-        await interaction.response.send_modal(RenameModal(self.voice_ch_id, self.text_ch_id))
-
-    # ── Закрити / відкрити ──────────────────────────────────────────────────
-    @discord.ui.button(label="🔒 Lock / Unlock", style=discord.ButtonStyle.secondary, row=0)
-    async def btn_lock(self, interaction: discord.Interaction, _):
-        if not self._is_owner(interaction):
-            await interaction.response.send_message("❌ Only room owner can do this!", ephemeral=True); return
-        ch = interaction.guild.get_channel(self.voice_ch_id)
-        if not ch:
-            await interaction.response.send_message("❌ Voice channel not found!", ephemeral=True); return
-        ow = ch.overwrites_for(interaction.guild.default_role)
-        currently_locked = ow.connect is False
-        if currently_locked:
-            ow.connect = None  # відкрити
-            await ch.set_permissions(interaction.guild.default_role, overwrite=ow)
-            await interaction.response.send_message("🔓 Room **unlocked** — anyone can join!", ephemeral=False)
-        else:
-            ow.connect = False  # закрити
-            await ch.set_permissions(interaction.guild.default_role, overwrite=ow)
-            await interaction.response.send_message("🔒 Room **locked** — only invited players can join!", ephemeral=False)
-
-    # ── Обмежити кількість ──────────────────────────────────────────────────
-    @discord.ui.button(label="👥 Set Limit", style=discord.ButtonStyle.secondary, row=0)
-    async def btn_limit(self, interaction: discord.Interaction, _):
-        if not self._is_owner(interaction):
-            await interaction.response.send_message("❌ Only room owner!", ephemeral=True); return
-        await interaction.response.send_modal(LimitModal(self.voice_ch_id))
-
-    # ── Запросити гравця ────────────────────────────────────────────────────
-    @discord.ui.button(label="➕ Invite Player", style=discord.ButtonStyle.success, row=1)
-    async def btn_invite(self, interaction: discord.Interaction, _):
-        if not self._is_owner(interaction):
-            await interaction.response.send_message("❌ Only room owner!", ephemeral=True); return
-        await interaction.response.send_message(
-            "Mention the player you want to invite (e.g. `@PlayerName`).\nI'll wait 30 seconds.",
-            ephemeral=True
-        )
-
-        def check(m):
-            return (m.author.id == interaction.user.id
-                    and m.channel.id == self.text_ch_id
-                    and m.mentions)
-
-        try:
-            msg = await bot.wait_for("message", check=check, timeout=30)
-            ch = interaction.guild.get_channel(self.voice_ch_id)
-            for target in msg.mentions:
-                await ch.set_permissions(target, connect=True, view_channel=True)
-            names = ", ".join(m.mention for m in msg.mentions)
-            await msg.channel.send(f"✅ Invited: {names}")
-        except asyncio.TimeoutError:
-            pass
-
-    # ── Видалити гравця ─────────────────────────────────────────────────────
-    @discord.ui.button(label="➖ Kick from Room", style=discord.ButtonStyle.danger, row=1)
-    async def btn_kick(self, interaction: discord.Interaction, _):
-        if not self._is_owner(interaction):
-            await interaction.response.send_message("❌ Only room owner!", ephemeral=True); return
-        ch = interaction.guild.get_channel(self.voice_ch_id)
-        if not ch or not ch.members:
-            await interaction.response.send_message("❌ Nobody in voice!", ephemeral=True); return
-
-        options = [
-            discord.SelectOption(label=m.display_name, value=str(m.id))
-            for m in ch.members if m.id != interaction.user.id
-        ]
-        if not options:
-            await interaction.response.send_message("No other players in voice.", ephemeral=True); return
-
-        view = KickSelectView(ch, options, interaction.user.id)
-        await interaction.response.send_message("Select player to kick:", view=view, ephemeral=True)
-
-    # ── Закрити кімнату ─────────────────────────────────────────────────────
-    @discord.ui.button(label="🗑️ Delete Room", style=discord.ButtonStyle.danger, row=1)
-    async def btn_delete(self, interaction: discord.Interaction, _):
-        if not self._is_owner(interaction):
-            await interaction.response.send_message("❌ Only room owner!", ephemeral=True); return
-
-        rooms = load_rooms()
-        vc = interaction.guild.get_channel(self.voice_ch_id)
-        tc = interaction.guild.get_channel(self.text_ch_id)
-        rooms.pop(str(self.voice_ch_id), None)
-        save_rooms(rooms)
-        await interaction.response.send_message("🗑️ Deleting room...")
-        await asyncio.sleep(1)
-        if vc: await vc.delete(reason="Owner deleted room")
-        if tc: await tc.delete(reason="Owner deleted room")
-
-class KickSelectView(discord.ui.View):
-    def __init__(self, voice_ch, options, owner_id):
-        super().__init__(timeout=30)
-        self.voice_ch = voice_ch
-        self.owner_id = owner_id
-        sel = discord.ui.Select(placeholder="Choose player...", options=options)
-        sel.callback = self.kick_callback
-        self.add_item(sel)
-
-    async def kick_callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("❌ Not your room!", ephemeral=True); return
-        uid = int(interaction.data["values"][0])
-        member = interaction.guild.get_member(uid)
-        if member and member.voice and member.voice.channel == self.voice_ch:
-            await member.move_to(None)
-        await self.voice_ch.set_permissions(member, overwrite=None)
-        await interaction.response.send_message(f"✅ {member.mention} kicked from room.", ephemeral=False)
-
-class RenameModal(discord.ui.Modal, title="Rename Room"):
-    name = discord.ui.TextInput(label="New room name", max_length=40, placeholder="My Epic Tank Room")
-
-    def __init__(self, voice_id, text_id):
-        super().__init__()
-        self.voice_id = voice_id
-        self.text_id = text_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        new_name = self.name.value.strip()
-        vc = interaction.guild.get_channel(self.voice_id)
-        tc = interaction.guild.get_channel(self.text_id)
-        if vc: await vc.edit(name=f"🎮 {new_name}")
-        if tc: await tc.edit(name=new_name.lower().replace(" ", "-"))
-        await interaction.response.send_message(f"✅ Room renamed to **{new_name}**")
-
-class LimitModal(discord.ui.Modal, title="Set Player Limit"):
-    limit = discord.ui.TextInput(label="Max players (0 = unlimited)", max_length=2, placeholder="4")
-
-    def __init__(self, voice_id):
-        super().__init__()
-        self.voice_id = voice_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            n = int(self.limit.value)
-            vc = interaction.guild.get_channel(self.voice_id)
-            if vc: await vc.edit(user_limit=n)
-            txt = f"**{n}** players" if n > 0 else "**unlimited**"
-            await interaction.response.send_message(f"✅ Limit set to {txt}")
-        except ValueError:
-            await interaction.response.send_message("❌ Enter a number!", ephemeral=True)
-
-# ── /room create ───────────────────────────────────────────────────────────────
-@room_group.command(name="create", description="Create a private room / Створити кімнату")
-@app_commands.describe(name="Room name", private="Lock room (invite only)")
-async def room_create(interaction: discord.Interaction, name: str = None, private: bool = False):
-    await interaction.response.defer(ephemeral=True)
-
-    guild = interaction.guild
-    member = interaction.user
-    room_name = name or f"{member.display_name}'s Room"
-
-    # Знайти категорію для кімнат
-    category = discord.utils.get(guild.categories, name="🏠 PRIVATE ROOMS")
-    if not category:
-        category = await guild.create_category("🏠 PRIVATE ROOMS")
-
-    # Права
-    ow = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=not private,
-            connect=not private
-        ),
-        member: discord.PermissionOverwrite(
-            view_channel=True, connect=True,
-            manage_channels=True, move_members=True
-        ),
-    }
-    # Модери/адміни завжди бачать
-    for r in guild.roles:
-        if r.permissions.administrator or r.name in ("🛡️ Moderator", "👑 Admin"):
-            ow[r] = discord.PermissionOverwrite(view_channel=True, connect=True)
-
-    # Голосовий канал
-    vc = await guild.create_voice_channel(
-        f"🎮 {room_name}",
-        category=category,
-        overwrites=ow,
-        reason=f"Room created by {member.display_name}"
-    )
-
-    # Текстовий канал кімнати
-    tc = await guild.create_text_channel(
-        room_name.lower().replace(" ", "-"),
-        category=category,
-        overwrites=ow,
-        topic=f"Room by {member.display_name} | Use buttons to manage",
-        reason=f"Room text by {member.display_name}"
-    )
-
-    # Зберегти
-    rooms = load_rooms()
-    rooms[str(vc.id)] = {
-        "owner_id": member.id,
-        "name": room_name,
-        "voice_id": vc.id,
-        "text_id": tc.id,
-        "private": private,
-        "empty_since": None,
-        "created": datetime.now().isoformat(),
-    }
-    save_rooms(rooms)
-
-    # ── Інструкція + кнопки управління ──────────────────────────────────────
-    lock_icon = "🔒 Private" if private else "🔓 Public"
-    embed = discord.Embed(
-        title=f"🏠 Room: {room_name}",
-        description=(
-            f"**Owner:** {member.mention}\n"
-            f"**Status:** {lock_icon}\n"
-            f"**Voice:** {vc.mention}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "**📖 HOW TO USE YOUR ROOM:**\n\n"
-            "✏️ **Rename** — change room name\n"
-            "🔒 **Lock/Unlock** — toggle private mode\n"
-            "👥 **Set Limit** — max players (e.g. 4)\n"
-            "➕ **Invite** — allow a specific player\n"
-            "➖ **Kick** — remove player from room\n"
-            "🗑️ **Delete** — close room immediately\n\n"
-            "⏳ Room auto-deletes **15 min** after everyone leaves.\n"
-            "━━━━━━━━━━━━━━━━━━━━"
-        ),
-        color=0x5865F2
-    )
-    embed.set_footer(text="Only room owner can use the buttons below")
-
-    view = RoomSettingsView(member.id, vc.id, tc.id)
-    await tc.send(embed=embed, view=view)
-
-    await interaction.followup.send(
-        f"✅ Room **{room_name}** created!\n"
-        f"🔊 Voice: {vc.mention}\n"
-        f"💬 Text: {tc.mention}",
-        ephemeral=True
-    )
-
-# ── /room list ─────────────────────────────────────────────────────────────────
-@room_group.command(name="list", description="Show active rooms / Список кімнат")
-async def room_list(interaction: discord.Interaction):
-    rooms = load_rooms()
-    if not rooms:
-        await interaction.response.send_message("📭 No active rooms right now.", ephemeral=True); return
-    embed = discord.Embed(title="🏠 Active Rooms", color=0x5865F2)
-    for ch_id, info in rooms.items():
-        vc = interaction.guild.get_channel(int(ch_id))
-        if not vc: continue
-        members = len(vc.members)
-        lock = "🔒" if info.get("private") else "🔓"
-        embed.add_field(
-            name=f"{lock} {info['name']}",
-            value=f"👥 {members} online | Owner: <@{info['owner_id']}>",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed)
-
-# ── /room close ────────────────────────────────────────────────────────────────
-@room_group.command(name="close", description="Delete your room / Видалити свою кімнату")
-async def room_close(interaction: discord.Interaction):
-    rooms = load_rooms()
-    uid = interaction.user.id
-    found = None
-    for ch_id, info in rooms.items():
-        if info["owner_id"] == uid:
-            found = (ch_id, info); break
-
-    if not found:
-        await interaction.response.send_message("❌ You don't have an active room.", ephemeral=True); return
-
-    ch_id, info = found
-    vc = interaction.guild.get_channel(int(ch_id))
-    tc = interaction.guild.get_channel(int(info.get("text_id", 0)))
-
-    rooms.pop(ch_id, None)
-    save_rooms(rooms)
-    await interaction.response.send_message("🗑️ Closing your room...", ephemeral=True)
-    if vc: await vc.delete(reason="Owner closed room")
-    if tc: await tc.delete(reason="Owner closed room")
-
-tree.add_command(room_group)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# КОМАНДИ: /bug /feedback /suggest — створюють пости у форум-каналах
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _find_forum(guild: discord.Guild, name: str) -> discord.ForumChannel | None:
-    return discord.utils.get(guild.forum_channels, name=name)
-
-def _find_tag(forum: discord.ForumChannel, keyword: str) -> discord.ForumTag | None:
-    kw = keyword.lower()
-    for tag in forum.available_tags:
-        if kw in tag.name.lower():
-            return tag
-    return None
-
-# ─── /bug ─────────────────────────────────────────────────────────────────────
-class BugModal(discord.ui.Modal, title="🐛 Bug Report"):
-    bug_title = discord.ui.TextInput(label="Bug title / Назва бага",
-                    placeholder="e.g. Tank clips through wall on Desert Storm", max_length=80)
-    bug_type = discord.ui.TextInput(label="Type: Visual / Gameplay / Crash / Network",
-                    placeholder="Gameplay", max_length=20)
-    description = discord.ui.TextInput(label="Description / Опис",
-                    style=discord.TextStyle.paragraph,
-                    placeholder="What happened? Steps to reproduce...", max_length=500)
-    severity = discord.ui.TextInput(label="Severity: Critical / Major / Minor",
-                    placeholder="Major", max_length=10)
-    platform = discord.ui.TextInput(label="Platform: PC / Mobile / Web",
-                    placeholder="PC", max_length=10)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        is_tester = any(r.name in ("🧪 Alpha Tester", "🔬 Beta Tester")
-                        for r in interaction.user.roles)
-        forum_name = "🐛│bugs-private" if is_tester else "🐛│bug-reports"
-        forum = _find_forum(interaction.guild, forum_name)
-
-        sev = self.severity.value.strip().lower()
-        sev_icons = {"critical": "🔴", "major": "🟡", "minor": "🟢"}
-        sev_icon = sev_icons.get(sev, "🟡")
-
-        content = (
-            f"**Type:** {self.bug_type.value}\n"
-            f"**Severity:** {sev_icon} {self.severity.value}\n"
-            f"**Platform:** {self.platform.value}\n\n"
-            f"**Description:**\n{self.description.value}\n\n"
-            f"*Reported by {interaction.user.mention}*"
-        )
-
-        if forum:
-            # Знайти тег severity
-            tag = _find_tag(forum, sev_icon) or _find_tag(forum, "major")
-            applied_tags = [tag] if tag else []
-            thread, _ = await forum.create_thread(
-                name=f"🐛 {self.bug_title.value}",
-                content=content,
-                applied_tags=applied_tags,
-                reason=f"Bug report by {interaction.user.display_name}"
-            )
-            await interaction.response.send_message(
-                f"✅ Bug posted: {thread.mention}", ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                f"✅ Bug report received! (forum channel not found)", ephemeral=True
-            )
-
-@tree.command(name="bug", description="Report a bug / Повідомити про баг")
-async def cmd_bug(interaction: discord.Interaction):
-    await interaction.response.send_modal(BugModal())
-
-# ─── /feedback ────────────────────────────────────────────────────────────────
-class FeedbackModal(discord.ui.Modal, title="⭐ Game Feedback"):
-    feature = discord.ui.TextInput(label="Feature / Що оцінюєш",
-                   placeholder="e.g. Tank controls, map design...", max_length=60)
-    rating = discord.ui.TextInput(label="Rating / Оцінка (1–10)",
-                   placeholder="7", max_length=2)
-    pros = discord.ui.TextInput(label="Pros / Плюси", style=discord.TextStyle.paragraph,
-                   placeholder="What works well?", max_length=300, required=False)
-    cons = discord.ui.TextInput(label="Cons / Мінуси", style=discord.TextStyle.paragraph,
-                   placeholder="What could be improved?", max_length=300, required=False)
-    suggestion = discord.ui.TextInput(label="Suggestion / Пропозиція",
-                   style=discord.TextStyle.paragraph,
-                   placeholder="How would you fix or improve it?", max_length=300, required=False)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        is_tester = any(r.name in ("🧪 Alpha Tester", "🔬 Beta Tester")
-                        for r in interaction.user.roles)
-        forum_name = "⭐│feedback" if is_tester else "⭐│reviews"
-        forum = _find_forum(interaction.guild, forum_name)
-
-        try:
-            r = int(self.rating.value.strip())
-            stars = "⭐" * min(max(round(r / 2), 1), 5)
-        except ValueError:
-            stars = "⭐"
-
-        lines = [
-            f"**Feature:** {self.feature.value}",
-            f"**Rating:** {self.rating.value}/10 {stars}",
-        ]
-        if self.pros.value:
-            lines.append(f"\n**✅ Pros:**\n{self.pros.value}")
-        if self.cons.value:
-            lines.append(f"\n**❌ Cons:**\n{self.cons.value}")
-        if self.suggestion.value:
-            lines.append(f"\n**💡 Suggestion:**\n{self.suggestion.value}")
-        lines.append(f"\n*By {interaction.user.mention}*")
-        content = "\n".join(lines)
-
-        if forum:
-            # Тег за жанром — намагаємось вгадати
-            tag = _find_tag(forum, "gameplay") or (forum.available_tags[0] if forum.available_tags else None)
-            applied_tags = [tag] if tag else []
-            thread, _ = await forum.create_thread(
-                name=f"⭐ {self.feature.value} — {self.rating.value}/10",
-                content=content,
-                applied_tags=applied_tags
-            )
-            await interaction.response.send_message(
-                f"✅ Feedback posted: {thread.mention}", ephemeral=True
-            )
-        else:
-            await interaction.response.send_message("✅ Feedback received!", ephemeral=True)
-
-@tree.command(name="feedback", description="Leave game feedback / Залишити відгук")
-async def cmd_feedback(interaction: discord.Interaction):
-    await interaction.response.send_modal(FeedbackModal())
-
-# ─── /suggest ─────────────────────────────────────────────────────────────────
-class SuggestModal(discord.ui.Modal, title="💡 Suggestion"):
-    idea = discord.ui.TextInput(label="Idea / Назва ідеї",
-                placeholder="e.g. Add shield ability for tanks", max_length=80)
-    details = discord.ui.TextInput(label="Details / Деталі", style=discord.TextStyle.paragraph,
-                placeholder="Describe how it would work...", max_length=500)
-    why = discord.ui.TextInput(label="Why? / Навіщо?", style=discord.TextStyle.paragraph,
-                placeholder="Why would this improve the game?", max_length=300)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        forum = _find_forum(interaction.guild, "💡│suggestions")
-        content = (
-            f"**Idea:** {self.idea.value}\n\n"
-            f"**Details:**\n{self.details.value}\n\n"
-            f"**Why:**\n{self.why.value}\n\n"
-            f"*Suggested by {interaction.user.mention}*\n\n"
-            f"React with 👍 to support or 👎 to oppose!"
-        )
-        if forum:
-            tag = _find_tag(forum, "new") or (forum.available_tags[0] if forum.available_tags else None)
-            applied_tags = [tag] if tag else []
-            thread, msg = await forum.create_thread(
-                name=f"💡 {self.idea.value}",
-                content=content,
-                applied_tags=applied_tags
-            )
-            # Додати голосування прямо у стартове повідомлення треду
-            await msg.add_reaction("👍")
-            await msg.add_reaction("👎")
-            await interaction.response.send_message(
-                f"✅ Suggestion posted: {thread.mention}", ephemeral=True
-            )
-        else:
-            await interaction.response.send_message("✅ Suggestion received!", ephemeral=True)
-
-@tree.command(name="suggest", description="Suggest a feature / Запропонувати ідею")
-async def cmd_suggest(interaction: discord.Interaction):
-    await interaction.response.send_modal(SuggestModal())
+    unban_loop.start()
+    print(f"✅ 8-BIT TANKS Moderation Bot online: {bot.user}")
 
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🚀 8-BIT TANKS Bot v3 starting...")
-    bot.run(TOKEN)
+    bot.run(os.getenv("DISCORD_TOKEN"))
