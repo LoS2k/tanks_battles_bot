@@ -1,13 +1,11 @@
 """
-🎮 8-BIT TANKS — Discord Bot v3
+🎮 8-BIT TANKS — Discord Bot v3 (Виправлена версія)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✅ Ролі: повна ієрархія (EN назви)
 ✅ Авто-видача ролі Player + флаг країни після реєстрації
 ✅ Голосові кімнати: створення, налаштування, закриття, +15хв після виходу
 ✅ Автопереклад у мовних каналах
 ✅ Реєстрація гравців
-
-pip install discord.py aiohttp python-dotenv
 """
 
 import discord
@@ -19,8 +17,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN    = os.getenv("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = int(os.getenv("GUILD_ID", "1495670166892314636"))
+
+if not TOKEN:
+    raise ValueError("❌ DISCORD_TOKEN not found in .env file!")
 
 # ─── МОВИ ──────────────────────────────────────────────────────────────────────
 LANGS = {
@@ -40,7 +41,7 @@ TRANSLATE_CHANNELS = [
 TRANSLATE_API = "https://api.mymemory.translated.net/get"
 
 # ─── БД ────────────────────────────────────────────────────────────────────────
-DB_FILE    = "players.json"
+DB_FILE = "players.json"
 ROOMS_FILE = "rooms.json"
 
 def load_db() -> dict:
@@ -98,12 +99,12 @@ tree = bot.tree
 async def room_cleanup_task():
     """Кожні 30с перевіряє чи минуло 15хв після того як кімната спорожніла."""
     rooms = load_rooms()
-    now   = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(timezone.utc).timestamp()
     to_delete = []
 
     for ch_id, info in rooms.items():
         empty_since = info.get("empty_since")
-        if empty_since and (now - empty_since) >= 900:   # 15 хвилин
+        if empty_since and (now - empty_since) >= 900:  # 15 хвилин
             to_delete.append(ch_id)
 
     for ch_id in to_delete:
@@ -113,7 +114,7 @@ async def room_cleanup_task():
             if ch:
                 try:
                     await ch.delete(reason="Room empty for 15 minutes")
-                    print(f"🗑️  Deleted empty room: {ch.name}")
+                    print(f"🗑️ Deleted empty room: {ch.name}")
                 except Exception:
                     pass
         rooms.pop(ch_id, None)
@@ -154,12 +155,12 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 # ─── ВИБІР МОВИ ────────────────────────────────────────────────────────────────
 class LangView(discord.ui.View):
-    def __init__(self, member: discord.Member):
+    def __init__(self, user: discord.User | discord.Member):
         super().__init__(timeout=300)
-        self.member = member
+        self.member = user
 
     async def _set(self, interaction: discord.Interaction, lang: str):
-        uid  = str(self.member.id)
+        uid = str(self.member.id)
         info = LANGS[lang]
 
         # Зберегти гравця
@@ -167,7 +168,7 @@ class LangView(discord.ui.View):
             "wins": 0, "losses": 0, "kills": 0, "deaths": 0,
             "registered": datetime.now().isoformat()
         }
-        player.update({"name": self.member.display_name, "lang": lang})
+        player.update({"name": self.member.display_name or self.member.name, "lang": lang})
         set_player(uid, player)
 
         guild = interaction.guild
@@ -212,15 +213,15 @@ class LangView(discord.ui.View):
         embed.set_footer(text="8-BIT TANKS • Welcome to the battlefield!")
         await interaction.response.edit_message(embed=embed, view=None)
 
-    @discord.ui.button(label="🇺🇦 Українська", style=discord.ButtonStyle.primary,  row=0)
+    @discord.ui.button(label="🇺🇦 Українська", style=discord.ButtonStyle.primary, row=0)
     async def btn_uk(self, i, _): await self._set(i, "uk")
-    @discord.ui.button(label="🇬🇧 English",    style=discord.ButtonStyle.primary,  row=0)
+    @discord.ui.button(label="🇬🇧 English", style=discord.ButtonStyle.primary, row=0)
     async def btn_en(self, i, _): await self._set(i, "en")
-    @discord.ui.button(label="🇩🇪 Deutsch",    style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🇩🇪 Deutsch", style=discord.ButtonStyle.secondary, row=1)
     async def btn_de(self, i, _): await self._set(i, "de")
-    @discord.ui.button(label="🇵🇱 Polski",     style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🇵🇱 Polski", style=discord.ButtonStyle.secondary, row=1)
     async def btn_pl(self, i, _): await self._set(i, "pl")
-    @discord.ui.button(label="🇫🇷 Français",   style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🇫🇷 Français", style=discord.ButtonStyle.secondary, row=1)
     async def btn_fr(self, i, _): await self._set(i, "fr")
 
 @bot.event
@@ -243,24 +244,24 @@ async def cmd_register(interaction: discord.Interaction):
         await interaction.response.send_message("⚠️ Already registered! Use `/lang` to change language.", ephemeral=True)
         return
     embed = discord.Embed(title="🎮 8-BIT TANKS — Choose Language", color=0xFFD700)
-    await interaction.response.send_message(embed=embed, view=LangView(interaction.member), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=LangView(interaction.user), ephemeral=True)
 
 # ─── КОМАНДА /lang ─────────────────────────────────────────────────────────────
 @tree.command(name="lang", description="Change language / Змінити мову")
 async def cmd_lang(interaction: discord.Interaction):
     embed = discord.Embed(title="🌐 Choose Language", color=0x5865F2)
-    await interaction.response.send_message(embed=embed, view=LangView(interaction.member), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=LangView(interaction.user), ephemeral=True)
 
 # ─── КОМАНДА /stats ────────────────────────────────────────────────────────────
 @tree.command(name="stats", description="Player statistics / Статистика")
 async def cmd_stats(interaction: discord.Interaction, player: discord.Member = None):
     target = player or interaction.user
-    data   = get_player(str(target.id))
+    data = get_player(str(target.id))
     if not data:
         await interaction.response.send_message("❌ Player not registered!", ephemeral=True)
         return
-    w  = data.get("wins", 0); l = data.get("losses", 0)
-    k  = data.get("kills", 0); d = data.get("deaths", 0)
+    w = data.get("wins", 0); l = data.get("losses", 0)
+    k = data.get("kills", 0); d = data.get("deaths", 0)
     kd = round(k / max(d, 1), 2)
     wr = round(w / max(w+l, 1) * 100, 1)
     lang = data.get("lang", "en")
@@ -268,29 +269,29 @@ async def cmd_stats(interaction: discord.Interaction, player: discord.Member = N
 
     embed = discord.Embed(title=f"📊 {target.display_name}", color=0xFFD700)
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="🏆 Wins",    value=str(w),       inline=True)
-    embed.add_field(name="💀 Losses",  value=str(l),       inline=True)
-    embed.add_field(name="📊 Win%",    value=f"{wr}%",     inline=True)
-    embed.add_field(name="🎯 Kills",   value=str(k),       inline=True)
-    embed.add_field(name="☠️ Deaths",  value=str(d),       inline=True)
-    embed.add_field(name="📈 K/D",     value=str(kd),      inline=True)
-    embed.add_field(name="🌐 Lang",    value=f"{flag} {LANGS.get(lang,{}).get('name',lang)}", inline=True)
+    embed.add_field(name="🏆 Wins", value=str(w), inline=True)
+    embed.add_field(name="💀 Losses", value=str(l), inline=True)
+    embed.add_field(name="📊 Win%", value=f"{wr}%", inline=True)
+    embed.add_field(name="🎯 Kills", value=str(k), inline=True)
+    embed.add_field(name="☠️ Deaths", value=str(d), inline=True)
+    embed.add_field(name="📈 K/D", value=str(kd), inline=True)
+    embed.add_field(name="🌐 Lang", value=f"{flag} {LANGS.get(lang,{}).get('name',lang)}", inline=True)
     embed.set_footer(text=f"Registered: {data.get('registered','')[:10]}")
     await interaction.response.send_message(embed=embed)
 
 # ─── КОМАНДА /top ──────────────────────────────────────────────────────────────
 @tree.command(name="top", description="Leaderboard / Таблиця лідерів")
 async def cmd_top(interaction: discord.Interaction):
-    db  = load_db()
+    db = load_db()
     top = sorted(db.items(), key=lambda x: x[1].get("wins", 0), reverse=True)[:10]
     embed = discord.Embed(title="🏆 8-BIT TANKS — TOP 10", color=0xFFD700)
     medals = ["🥇","🥈","🥉"] + ["🎖️"]*7
     for i, (uid, d) in enumerate(top):
-        kd   = round(d.get("kills",0)/max(d.get("deaths",1),1), 2)
+        kd = round(d.get("kills",0)/max(d.get("deaths",1),1), 2)
         flag = LANGS.get(d.get("lang","en"), {}).get("flag", "🌐")
         embed.add_field(
             name=f"{medals[i]} #{i+1} {flag} {d.get('name','?')}",
-            value=f"🏆 {d.get('wins',0)} wins  •  K/D {kd}",
+            value=f"🏆 {d.get('wins',0)} wins • K/D {kd}",
             inline=False
         )
     await interaction.response.send_message(embed=embed)
@@ -302,7 +303,7 @@ async def cmd_win(interaction: discord.Interaction, player: discord.Member, kill
     d = get_player(str(player.id))
     if not d:
         await interaction.response.send_message("❌ Not registered!", ephemeral=True); return
-    d["wins"]  = d.get("wins",0)  + 1
+    d["wins"] = d.get("wins",0) + 1
     d["kills"] = d.get("kills",0) + kills
     set_player(str(player.id), d)
     await interaction.response.send_message(f"✅ +1 Win, +{kills} Kills → **{player.display_name}** 🏆")
@@ -313,8 +314,8 @@ async def cmd_loss(interaction: discord.Interaction, player: discord.Member, dea
     d = get_player(str(player.id))
     if not d:
         await interaction.response.send_message("❌ Not registered!", ephemeral=True); return
-    d["losses"]  = d.get("losses",0)  + 1
-    d["deaths"]  = d.get("deaths",0) + deaths
+    d["losses"] = d.get("losses",0) + 1
+    d["deaths"] = d.get("deaths",0) + deaths
     set_player(str(player.id), d)
     await interaction.response.send_message(f"📝 +1 Loss, +{deaths} Deaths → **{player.display_name}**")
 
@@ -334,33 +335,29 @@ def ch_lang(name: str) -> str | None:
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.content or message.content.startswith("/"): 
-        await bot.process_commands(message); return
+    if message.author.bot or not message.content:
+        return
 
     target_lang = ch_lang(message.channel.name)
-    if not target_lang:
-        await bot.process_commands(message); return
-
-    author_lang = get_lang(message.author)
-    if author_lang == target_lang:
-        await bot.process_commands(message); return
-
-    translated = await translate_text(message.content, target_lang, author_lang)
-    if translated:
-        af = LANGS.get(author_lang, {}).get("flag", "🌐")
-        tf = LANGS[target_lang]["flag"]
-        embed = discord.Embed(description=f"**{translated}**", color=0x5865F2)
-        embed.set_author(
-            name=f"{af} {message.author.display_name} → {tf} Auto-translate",
-            icon_url=message.author.display_avatar.url
-        )
-        embed.set_footer(text="MyMemory • /translate for manual translation")
-        await message.channel.send(embed=embed)
+    if target_lang:
+        author_lang = get_lang(message.author)
+        if author_lang != target_lang:
+            translated = await translate_text(message.content, target_lang, author_lang)
+            if translated:
+                af = LANGS.get(author_lang, {}).get("flag", "🌐")
+                tf = LANGS[target_lang]["flag"]
+                embed = discord.Embed(description=f"**{translated}**", color=0x5865F2)
+                embed.set_author(
+                    name=f"{af} {message.author.display_name} → {tf} Auto-translate",
+                    icon_url=message.author.display_avatar.url
+                )
+                embed.set_footer(text="MyMemory • /translate for manual translation")
+                await message.channel.send(embed=embed)
 
     await bot.process_commands(message)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  СИСТЕМА ПРИВАТНИХ КІМНАТ
+# СИСТЕМА ПРИВАТНИХ КІМНАТ
 # ══════════════════════════════════════════════════════════════════════════════
 
 room_group = app_commands.Group(name="room", description="Private room management / Управління кімнатою")
@@ -368,10 +365,10 @@ room_group = app_commands.Group(name="room", description="Private room managemen
 class RoomSettingsView(discord.ui.View):
     """Панель управління кімнатою — пишеться у текстовий канал кімнати."""
     def __init__(self, owner_id: int, voice_ch_id: int, text_ch_id: int):
-        super().__init__(timeout=None)   # постійна
-        self.owner_id   = owner_id
+        super().__init__(timeout=None)  # постійна
+        self.owner_id = owner_id
         self.voice_ch_id = voice_ch_id
-        self.text_ch_id  = text_ch_id
+        self.text_ch_id = text_ch_id
 
     def _is_owner(self, i: discord.Interaction) -> bool:
         return i.user.id == self.owner_id
@@ -394,7 +391,7 @@ class RoomSettingsView(discord.ui.View):
         ow = ch.overwrites_for(interaction.guild.default_role)
         currently_locked = ow.connect is False
         if currently_locked:
-            ow.connect = None   # відкрити
+            ow.connect = None  # відкрити
             await ch.set_permissions(interaction.guild.default_role, overwrite=ow)
             await interaction.response.send_message("🔓 Room **unlocked** — anyone can join!", ephemeral=False)
         else:
@@ -426,7 +423,7 @@ class RoomSettingsView(discord.ui.View):
 
         try:
             msg = await bot.wait_for("message", check=check, timeout=30)
-            ch  = interaction.guild.get_channel(self.voice_ch_id)
+            ch = interaction.guild.get_channel(self.voice_ch_id)
             for target in msg.mentions:
                 await ch.set_permissions(target, connect=True, view_channel=True)
             names = ", ".join(m.mention for m in msg.mentions)
@@ -469,7 +466,6 @@ class RoomSettingsView(discord.ui.View):
         if vc: await vc.delete(reason="Owner deleted room")
         if tc: await tc.delete(reason="Owner deleted room")
 
-
 class KickSelectView(discord.ui.View):
     def __init__(self, voice_ch, options, owner_id):
         super().__init__(timeout=30)
@@ -482,13 +478,12 @@ class KickSelectView(discord.ui.View):
     async def kick_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message("❌ Not your room!", ephemeral=True); return
-        uid    = int(interaction.data["values"][0])
+        uid = int(interaction.data["values"][0])
         member = interaction.guild.get_member(uid)
         if member and member.voice and member.voice.channel == self.voice_ch:
             await member.move_to(None)
         await self.voice_ch.set_permissions(member, overwrite=None)
         await interaction.response.send_message(f"✅ {member.mention} kicked from room.", ephemeral=False)
-
 
 class RenameModal(discord.ui.Modal, title="Rename Room"):
     name = discord.ui.TextInput(label="New room name", max_length=40, placeholder="My Epic Tank Room")
@@ -496,7 +491,7 @@ class RenameModal(discord.ui.Modal, title="Rename Room"):
     def __init__(self, voice_id, text_id):
         super().__init__()
         self.voice_id = voice_id
-        self.text_id  = text_id
+        self.text_id = text_id
 
     async def on_submit(self, interaction: discord.Interaction):
         new_name = self.name.value.strip()
@@ -505,7 +500,6 @@ class RenameModal(discord.ui.Modal, title="Rename Room"):
         if vc: await vc.edit(name=f"🎮 {new_name}")
         if tc: await tc.edit(name=new_name.lower().replace(" ", "-"))
         await interaction.response.send_message(f"✅ Room renamed to **{new_name}**")
-
 
 class LimitModal(discord.ui.Modal, title="Set Player Limit"):
     limit = discord.ui.TextInput(label="Max players (0 = unlimited)", max_length=2, placeholder="4")
@@ -516,7 +510,7 @@ class LimitModal(discord.ui.Modal, title="Set Player Limit"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            n  = int(self.limit.value)
+            n = int(self.limit.value)
             vc = interaction.guild.get_channel(self.voice_id)
             if vc: await vc.edit(user_limit=n)
             txt = f"**{n}** players" if n > 0 else "**unlimited**"
@@ -524,15 +518,14 @@ class LimitModal(discord.ui.Modal, title="Set Player Limit"):
         except ValueError:
             await interaction.response.send_message("❌ Enter a number!", ephemeral=True)
 
-
 # ── /room create ───────────────────────────────────────────────────────────────
 @room_group.command(name="create", description="Create a private room / Створити кімнату")
 @app_commands.describe(name="Room name", private="Lock room (invite only)")
 async def room_create(interaction: discord.Interaction, name: str = None, private: bool = False):
     await interaction.response.defer(ephemeral=True)
 
-    guild   = interaction.guild
-    member  = interaction.user
+    guild = interaction.guild
+    member = interaction.user
     room_name = name or f"{member.display_name}'s Room"
 
     # Знайти категорію для кімнат
@@ -576,13 +569,13 @@ async def room_create(interaction: discord.Interaction, name: str = None, privat
     # Зберегти
     rooms = load_rooms()
     rooms[str(vc.id)] = {
-        "owner_id":       member.id,
-        "name":           room_name,
-        "voice_id":       vc.id,
-        "text_id":        tc.id,
-        "private":        private,
-        "empty_since":    None,
-        "created":        datetime.now().isoformat(),
+        "owner_id": member.id,
+        "name": room_name,
+        "voice_id": vc.id,
+        "text_id": tc.id,
+        "private": private,
+        "empty_since": None,
+        "created": datetime.now().isoformat(),
     }
     save_rooms(rooms)
 
@@ -630,7 +623,7 @@ async def room_list(interaction: discord.Interaction):
         vc = interaction.guild.get_channel(int(ch_id))
         if not vc: continue
         members = len(vc.members)
-        lock    = "🔒" if info.get("private") else "🔓"
+        lock = "🔒" if info.get("private") else "🔓"
         embed.add_field(
             name=f"{lock} {info['name']}",
             value=f"👥 {members} online | Owner: <@{info['owner_id']}>",
@@ -642,7 +635,7 @@ async def room_list(interaction: discord.Interaction):
 @room_group.command(name="close", description="Delete your room / Видалити свою кімнату")
 async def room_close(interaction: discord.Interaction):
     rooms = load_rooms()
-    uid   = interaction.user.id
+    uid = interaction.user.id
     found = None
     for ch_id, info in rooms.items():
         if info["owner_id"] == uid:
@@ -664,7 +657,7 @@ async def room_close(interaction: discord.Interaction):
 tree.add_command(room_group)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  КОМАНДИ: /bug  /feedback  /suggest  — створюють пости у форум-каналах
+# КОМАНДИ: /bug /feedback /suggest — створюють пости у форум-каналах
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _find_forum(guild: discord.Guild, name: str) -> discord.ForumChannel | None:
@@ -679,16 +672,16 @@ def _find_tag(forum: discord.ForumChannel, keyword: str) -> discord.ForumTag | N
 
 # ─── /bug ─────────────────────────────────────────────────────────────────────
 class BugModal(discord.ui.Modal, title="🐛 Bug Report"):
-    bug_title   = discord.ui.TextInput(label="Bug title / Назва бага",
+    bug_title = discord.ui.TextInput(label="Bug title / Назва бага",
                     placeholder="e.g. Tank clips through wall on Desert Storm", max_length=80)
-    bug_type    = discord.ui.TextInput(label="Type: Visual / Gameplay / Crash / Network",
+    bug_type = discord.ui.TextInput(label="Type: Visual / Gameplay / Crash / Network",
                     placeholder="Gameplay", max_length=20)
     description = discord.ui.TextInput(label="Description / Опис",
                     style=discord.TextStyle.paragraph,
                     placeholder="What happened? Steps to reproduce...", max_length=500)
-    severity    = discord.ui.TextInput(label="Severity: Critical / Major / Minor",
+    severity = discord.ui.TextInput(label="Severity: Critical / Major / Minor",
                     placeholder="Major", max_length=10)
-    platform    = discord.ui.TextInput(label="Platform: PC / Mobile / Web",
+    platform = discord.ui.TextInput(label="Platform: PC / Mobile / Web",
                     placeholder="PC", max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -699,7 +692,7 @@ class BugModal(discord.ui.Modal, title="🐛 Bug Report"):
 
         sev = self.severity.value.strip().lower()
         sev_icons = {"critical": "🔴", "major": "🟡", "minor": "🟢"}
-        sev_icon  = sev_icons.get(sev, "🟡")
+        sev_icon = sev_icons.get(sev, "🟡")
 
         content = (
             f"**Type:** {self.bug_type.value}\n"
@@ -731,16 +724,15 @@ class BugModal(discord.ui.Modal, title="🐛 Bug Report"):
 async def cmd_bug(interaction: discord.Interaction):
     await interaction.response.send_modal(BugModal())
 
-
 # ─── /feedback ────────────────────────────────────────────────────────────────
 class FeedbackModal(discord.ui.Modal, title="⭐ Game Feedback"):
-    feature    = discord.ui.TextInput(label="Feature / Що оцінюєш",
+    feature = discord.ui.TextInput(label="Feature / Що оцінюєш",
                    placeholder="e.g. Tank controls, map design...", max_length=60)
-    rating     = discord.ui.TextInput(label="Rating / Оцінка (1–10)",
+    rating = discord.ui.TextInput(label="Rating / Оцінка (1–10)",
                    placeholder="7", max_length=2)
-    pros       = discord.ui.TextInput(label="Pros / Плюси", style=discord.TextStyle.paragraph,
+    pros = discord.ui.TextInput(label="Pros / Плюси", style=discord.TextStyle.paragraph,
                    placeholder="What works well?", max_length=300, required=False)
-    cons       = discord.ui.TextInput(label="Cons / Мінуси", style=discord.TextStyle.paragraph,
+    cons = discord.ui.TextInput(label="Cons / Мінуси", style=discord.TextStyle.paragraph,
                    placeholder="What could be improved?", max_length=300, required=False)
     suggestion = discord.ui.TextInput(label="Suggestion / Пропозиція",
                    style=discord.TextStyle.paragraph,
@@ -760,7 +752,7 @@ class FeedbackModal(discord.ui.Modal, title="⭐ Game Feedback"):
 
         lines = [
             f"**Feature:** {self.feature.value}",
-            f"**Rating:** {self.rating.value}/10  {stars}",
+            f"**Rating:** {self.rating.value}/10 {stars}",
         ]
         if self.pros.value:
             lines.append(f"\n**✅ Pros:**\n{self.pros.value}")
@@ -790,14 +782,13 @@ class FeedbackModal(discord.ui.Modal, title="⭐ Game Feedback"):
 async def cmd_feedback(interaction: discord.Interaction):
     await interaction.response.send_modal(FeedbackModal())
 
-
 # ─── /suggest ─────────────────────────────────────────────────────────────────
 class SuggestModal(discord.ui.Modal, title="💡 Suggestion"):
-    idea    = discord.ui.TextInput(label="Idea / Назва ідеї",
+    idea = discord.ui.TextInput(label="Idea / Назва ідеї",
                 placeholder="e.g. Add shield ability for tanks", max_length=80)
     details = discord.ui.TextInput(label="Details / Деталі", style=discord.TextStyle.paragraph,
                 placeholder="Describe how it would work...", max_length=500)
-    why     = discord.ui.TextInput(label="Why? / Навіщо?", style=discord.TextStyle.paragraph,
+    why = discord.ui.TextInput(label="Why? / Навіщо?", style=discord.TextStyle.paragraph,
                 placeholder="Why would this improve the game?", max_length=300)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -829,7 +820,6 @@ class SuggestModal(discord.ui.Modal, title="💡 Suggestion"):
 @tree.command(name="suggest", description="Suggest a feature / Запропонувати ідею")
 async def cmd_suggest(interaction: discord.Interaction):
     await interaction.response.send_modal(SuggestModal())
-
 
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
