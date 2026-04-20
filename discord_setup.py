@@ -10,8 +10,8 @@ import asyncio, os
 from dotenv import load_dotenv
 
 load_dotenv()
-TOKEN    = os.getenv("DISCORD_TOKEN", "YOUR_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+TOKEN    = os.getenv("DISCORD_TOKEN", "MTQ5NTc1NTA1MjQwMzUyMzcxNQ.GhMy2k.xGizqMy-V9_AbkTBoPEwBJekmbe0SiQNpYLerk")
+GUILD_ID = int(os.getenv("GUILD_ID", "1495670166892314636"))
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!!", intents=intents)
